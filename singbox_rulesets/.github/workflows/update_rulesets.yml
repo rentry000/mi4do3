@@ -1,0 +1,113 @@
+name: Update singbox Rulesets (SSH)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+    - name: Configure Git for SSH
+      run: |
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        ssh-keyscan github.com >> ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        # 禁用嵌入式仓库警告
+        git config --global advice.addEmbeddedRepo false
+
+    - name: Install SSH Key
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.ACTIONS }}
+
+    - name: Checkout repository via SSH
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ssh-key: ${{ secrets.ACTIONS }}
+
+    - name: Clean existing rulesets
+      run: |
+        if [ -f .gitmodules ]; then
+            git submodule deinit -f singbox_rulesets
+            git rm --cached singbox_rulesets
+            rm -rf .git/modules/singbox_rulesets
+        fi
+        rm -rf singbox_rulesets
+        mkdir -p singbox_rulesets
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12.11'
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y python3-pip wget
+        pip3 install --upgrade pip
+        pip3 install requests beautifulsoup4
+
+    - name: Download sing-box
+      run: |
+        version="1.12.0"
+        wget https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-amd64.tar.gz
+        tar -xzf sing-box-$version-linux-amd64.tar.gz
+        sudo mv sing-box-$version-linux-amd64/sing-box /usr/local/bin/
+        sudo chmod +x /usr/local/bin/sing-box
+        rm -rf sing-box-$version-linux-amd64*
+        sing-box version
+
+    - name: Verify sing-box installation
+      run: |
+        sing-box version
+        if [ $? -ne 0 ]; then
+          echo "❌ sing-box安装失败"
+          exit 1
+        fi
+
+    - name: Run ruleset generator
+      run: |
+        python3 singbox_ruleset_generator.py
+        
+        # 清理嵌入式仓库（如果存在）
+        if [ -d "singbox_rulesets/.git" ]; then
+            echo "检测到嵌入式Git仓库，正在清理..."
+            rm -rf singbox_rulesets/.git
+        fi
+
+    - name: Commit and push changes
+      run: |
+        # 先拉取最新变更避免冲突
+        git pull --rebase origin main
+        
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "检测到文件变更，准备提交..."
+          git add -A
+          
+          # 特殊处理规则集目录
+          if [ -d "singbox_rulesets" ]; then
+              git add singbox_rulesets/
+          fi
+
+          TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+          git commit -m "自动更新singbox规则集 ($TIMESTAMP)"
+          
+          # 使用强制推送确保成功
+          git push origin HEAD:main --force
+        else
+          echo "无变更，跳过提交"
+        fi
+
+    - name: Clean SSH keys
+      run: |
+        rm -rf ~/.ssh
+        git config --global --unset url.git@github.com:.insteadOf
